@@ -22,6 +22,9 @@ from datetime import datetime, timedelta
 # Load environment variables
 load_dotenv()
 
+# In-memory storage fallback (for development/testing)
+user_tokens = {}
+
 app = FastAPI(
     title="Smart Job Application Tracker",
     description="A FastAPI backend for tracking job applications via Gmail integration",
@@ -305,8 +308,8 @@ async def health_check():
 async def login():
     """Initiate Google OAuth login."""
     try:
-        # Use backend URL for redirect URI since we need to handle the callback
-        backend_url = "http://localhost:8001"
+        # Use environment variable for backend URL
+        backend_url = os.getenv("BACKEND_URL", "https://job-tracker-backend-pij9.onrender.com")
         
         flow = Flow.from_client_config(
             {
@@ -337,7 +340,8 @@ async def login():
 async def auth_callback(code: str, state: Optional[str] = None):
     """Handle OAuth callback and exchange code for tokens."""
     try:
-        backend_url = "http://localhost:8001"
+        # Use environment variable for backend URL
+        backend_url = os.getenv("BACKEND_URL", "https://job-tracker-backend-pij9.onrender.com")
         flow = Flow.from_client_config(
             {
                 "web": {
