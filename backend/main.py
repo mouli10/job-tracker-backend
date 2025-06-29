@@ -16,6 +16,8 @@ from pydantic import BaseModel
 from dotenv import load_dotenv
 import secrets
 from supabase import create_client, Client
+import jwt
+from datetime import datetime, timedelta
 
 # Load environment variables
 load_dotenv()
@@ -42,6 +44,11 @@ app.add_middleware(
 
 # Security
 security = HTTPBearer()
+
+# JWT Secret (in production, use a secure secret)
+JWT_SECRET = os.getenv("JWT_SECRET", "your-secret-key-change-in-production")
+JWT_ALGORITHM = "HS256"
+JWT_EXPIRATION_HOURS = 24 * 7  # 7 days
 
 # Pydantic models
 class EmailSummary(BaseModel):
@@ -203,29 +210,90 @@ def get_user_emails(service, max_results: int = 50) -> List[Dict[str, Any]]:
 # Helper functions for Supabase token storage
 
 def save_user_token_db(user_id, token_data):
-    data = {
-        "user_id": user_id,
-        "token": token_data['token'],
-        "refresh_token": token_data['refresh_token'],
-        "token_uri": token_data['token_uri'],
-        "client_id": token_data['client_id'],
-        "client_secret": token_data['client_secret'],
-        "scopes": ','.join(token_data['scopes']) if isinstance(token_data['scopes'], list) else str(token_data['scopes'])
-    }
-    supabase.table("user_tokens").upsert(data).execute()
+    """Save user token data to Supabase."""
+    try:
+        # Store in Supabase
+        result = supabase.table('user_tokens').upsert({
+            'user_id': user_id,
+            'token_data': json.dumps(token_data),
+            'created_at': datetime.utcnow().isoformat(),
+            'updated_at': datetime.utcnow().isoformat()
+        }).execute()
+        print(f"Token saved to Supabase for user {user_id}")
+    except Exception as e:
+        print(f"Error saving token to Supabase: {e}")
+        # Fallback to in-memory storage
+        user_tokens[user_id] = token_data
 
 def get_user_token_db(user_id):
-    result = supabase.table("user_tokens").select("*").eq("user_id", user_id).execute()
-    if result.data and len(result.data) > 0:
-        row = result.data[0]
-        return {
-            "token": row["token"],
-            "refresh_token": row["refresh_token"],
-            "token_uri": row["token_uri"],
-            "client_id": row["client_id"],
-            "client_secret": row["client_secret"],
-            "scopes": row["scopes"].split(",") if row["scopes"] else []
-        }
+    """Get user token data from Supabase."""
+    try:
+        # Try Supabase first
+        result = supabase.table('user_tokens').select('*').eq('user_id', user_id).execute()
+        if result.data:
+            token_record = result.data[0]
+            return json.loads(token_record['token_data'])
+    except Exception as e:
+        print(f"Error getting token from Supabase: {e}")
+    
+    # Fallback to in-memory storage
+    return user_tokens.get(user_id)
+
+def save_user_email_mapping(user_id, email):
+    """Save user email mapping to Supabase."""
+    try:
+        result = supabase.table('user_emails').upsert({
+            'user_id': user_id,
+            'email': email,
+            'created_at': datetime.utcnow().isoformat(),
+            'updated_at': datetime.utcnow().isoformat()
+        }).execute()
+        print(f"Email mapping saved to Supabase: {email} -> {user_id}")
+    except Exception as e:
+        print(f"Error saving email mapping to Supabase: {e}")
+
+def get_user_id_by_email(email):
+    """Get user ID by email from Supabase."""
+    try:
+        result = supabase.table('user_emails').select('user_id').eq('email', email).execute()
+        if result.data:
+            return result.data[0]['user_id']
+    except Exception as e:
+        print(f"Error getting user ID by email from Supabase: {e}")
+    return None
+
+# Session management
+def create_user_token(user_id: str, email: str) -> str:
+    """Create a JWT token for user session."""
+    payload = {
+        "user_id": user_id,
+        "email": email,
+        "exp": datetime.utcnow() + timedelta(hours=JWT_EXPIRATION_HOURS)
+    }
+    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+
+def verify_user_token(token: str) -> Optional[Dict[str, Any]]:
+    """Verify and decode user JWT token."""
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        return payload
+    except jwt.ExpiredSignatureError:
+        return None
+    except jwt.InvalidTokenError:
+        return None
+
+def get_current_user(request: Request) -> Optional[Dict[str, Any]]:
+    """Get current user from request cookies or headers."""
+    # Check for token in cookies first
+    token = request.cookies.get("user_token")
+    if not token:
+        # Check for token in Authorization header
+        auth_header = request.headers.get("Authorization")
+        if auth_header and auth_header.startswith("Bearer "):
+            token = auth_header.split(" ")[1]
+    
+    if token:
+        return verify_user_token(token)
     return None
 
 @app.get("/")
@@ -285,7 +353,22 @@ async def auth_callback(code: str, state: Optional[str] = None):
         flow.redirect_uri = f"{backend_url}/auth/callback"
         flow.fetch_token(code=code)
         credentials = flow.credentials
-        user_id = secrets.token_urlsafe(32)
+        
+        # Get user info from Gmail API
+        service = build('gmail', 'v1', credentials=credentials)
+        profile = service.users().getProfile(userId='me').execute()
+        user_email = profile['emailAddress']
+        
+        # Check if user already exists (by email)
+        existing_user_id = get_user_id_by_email(user_email)
+        if existing_user_id:
+            user_id = existing_user_id
+            print(f"Existing user {user_email} logged in")
+        else:
+            user_id = secrets.token_urlsafe(32)
+            print(f"New user {user_email} created")
+        
+        # Store credentials
         token_data = {
             'token': credentials.token,
             'refresh_token': credentials.refresh_token,
@@ -295,9 +378,28 @@ async def auth_callback(code: str, state: Optional[str] = None):
             'scopes': credentials.scopes
         }
         save_user_token_db(user_id, token_data)
-        print(f"Stored credentials for user {user_id}")
+        
+        # Store user email mapping
+        save_user_email_mapping(user_id, user_email)
+        
+        # Create session token
+        session_token = create_user_token(user_id, user_email)
+        
+        print(f"Stored credentials for user {user_id} ({user_email})")
         frontend_url = os.getenv("FRONTEND_URL", "http://localhost:5173")
-        return RedirectResponse(url=f"{frontend_url}/dashboard?user_id={user_id}")
+        
+        # Redirect with session token
+        response = RedirectResponse(url=f"{frontend_url}/dashboard?user_id={user_id}")
+        response.set_cookie(
+            key="user_token",
+            value=session_token,
+            httponly=True,
+            secure=True,  # Use HTTPS in production
+            samesite="lax",
+            max_age=JWT_EXPIRATION_HOURS * 3600  # Convert hours to seconds
+        )
+        return response
+        
     except Exception as e:
         print(f"Auth callback error: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Authentication failed: {str(e)}")
@@ -393,6 +495,25 @@ async def get_dashboard_stats(user_id: str):
         return stats
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to fetch dashboard stats: {str(e)}")
+
+@app.get("/auth/session")
+async def check_session(request: Request):
+    """Check if user has a valid session."""
+    user = get_current_user(request)
+    if user:
+        return {
+            "authenticated": True,
+            "user_id": user["user_id"],
+            "email": user["email"]
+        }
+    return {"authenticated": False}
+
+@app.get("/auth/logout")
+async def logout():
+    """Logout user by clearing session."""
+    response = JSONResponse({"message": "Logged out successfully"})
+    response.delete_cookie("user_token")
+    return response
 
 if __name__ == "__main__":
     import uvicorn
