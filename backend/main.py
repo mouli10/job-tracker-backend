@@ -33,6 +33,7 @@ app.add_middleware(
         os.getenv("FRONTEND_URL", "http://localhost:5173"),
         "https://*.vercel.app",  # Allow all Vercel deployments
         "https://*.onrender.com",  # Allow Render deployments
+        "https://job-tracker-frontend-tau.vercel.app",  # Your specific Vercel domain
     ],
     allow_credentials=True,
     allow_methods=["*"],
